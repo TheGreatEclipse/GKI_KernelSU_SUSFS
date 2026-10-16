@@ -1,69 +1,124 @@
 name: 'Apply Kernel Branding & Timestamp'
-description: 'Apply kernel branding to kernel version string'
+description: 'Auto-detect kernel version, preserve SCM versioning, and set build timestamp'
+
 inputs:
   variant:
-    description: 'Variant of kernel to apply branding to'
+    description: 'Kernel variant'
     required: true
   kernel_version:
-    description: 'Kernel version (e.g., 6.1)'
-    required: true
+    description: 'Optional kernel version override; auto-detected if empty'
+    required: false
+    default: ''
   android_version:
-    description: 'Android version (e.g., android14)'
-    required: true
+    description: 'Optional Android version override; auto-detected if empty'
+    required: false
+    default: ''
   version:
-    description: 'Combined version (e.g., android14-6.1)'
-    required: true
+    description: 'Optional combined version override; auto-detected if empty'
+    required: false
+    default: ''
   sublevel:
-    description: 'Sublevel of kernel version (e.g., 1)'
-    required: true
+    description: 'Optional kernel sublevel override; auto-detected if empty'
+    required: false
+    default: ''
   brand_name:
-    description: 'Branding text appended to the version (e.g., Wild). Empty = stock version string.'
+    description: 'Brand appended to the stock version. Empty preserves stock.'
     required: false
-    default: Wild
+    default: ''
   keep_kmi:
-    description: 'Keep stock KMI generation suffix (e.g., -8) and append brand after it. Off = legacy hardcoded replace.'
+    description: 'Preserve the existing kernel version and SCM suffix'
     required: false
-    default: 'false'
+    default: 'true'
 
 runs:
-  using: "composite"
+  using: composite
   steps:
-    - name: Apply Kernel Name Branding
+    - name: Configure Kernel Branding and Timestamp
       shell: bash
       working-directory: ${{ github.workspace }}/kernel/common
+      env:
+        INPUT_VARIANT: ${{ inputs.variant }}
+        INPUT_KERNEL_VERSION: ${{ inputs.kernel_version }}
+        INPUT_ANDROID_VERSION: ${{ inputs.android_version }}
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_SUBLEVEL: ${{ inputs.sublevel }}
+        BRAND_NAME: ${{ inputs.brand_name }}
+        KEEP_KMI: ${{ inputs.keep_kmi }}
       run: |
-        VERSION="${{ inputs.version }}"
-        ANDROID_PART=$(echo "$VERSION" | cut -d- -f1)
-        KERNEL_PART=$(echo "$VERSION" | cut -d- -f2)
-        BRAND="${{ inputs.brand_name }}"
-        KEEP_KMI="${{ inputs.keep_kmi }}"
+        set -euo pipefail
 
-        if [ -z "$BRAND" ]; then
-          echo "brand_name is empty, keeping stock kernel version string"
+        # Use a real, human-readable current timestamp.
+        BUILD_TIMESTAMP="$(date -u '+%a %b %d %H:%M:%S UTC %Y')"
+        echo "KBUILD_BUILD_TIMESTAMP=$BUILD_TIMESTAMP" >> "$GITHUB_ENV"
+
+        # Detect the source revision. Never fabricate a commit hash.
+        COMMIT="$(git rev-parse --short=12 HEAD 2>/dev/null || true)"
+        if [[ -n "$COMMIT" ]]; then
+          echo "Source commit: $COMMIT"
+        else
+          echo "No Git commit available; SCM version detection may be limited."
+        fi
+
+        # Auto-detect kernel version from the source Makefile.
+        DETECTED_VERSION="$(
+          awk '$1 == "VERSION" {print $3; exit}' Makefile
+        )"
+        DETECTED_PATCHLEVEL="$(
+          awk '$1 == "PATCHLEVEL" {print $3; exit}' Makefile
+        )"
+        DETECTED_SUBLEVEL="$(
+          awk '$1 == "SUBLEVEL" {print $3; exit}' Makefile
+        )"
+
+        KERNEL_VERSION="${INPUT_KERNEL_VERSION:-${DETECTED_VERSION}.${DETECTED_PATCHLEVEL}.${DETECTED_SUBLEVEL}}"
+        ANDROID_VERSION="${INPUT_ANDROID_VERSION:-$(grep -hE '^BRANCH=' build.config.common build.config.constants 2>/dev/null | head -n1 | cut -d= -f2- || true)}"
+
+        # Infer Android version from Kleaf's common branch when available.
+        if [[ -z "$ANDROID_VERSION" ]]; then
+          BRANCH="$(git branch --show-current 2>/dev/null || true)"
+          if [[ "$BRANCH" =~ (android[0-9]+) ]]; then
+            ANDROID_VERSION="${BASH_REMATCH[1]}"
+          else
+            ANDROID_VERSION="android16"
+            echo "WARNING: Android version could not be detected; defaulting to android16."
+          fi
+        fi
+
+        # Detect the standard Kleaf/common branch version if not supplied.
+        VERSION="${INPUT_VERSION:-}"
+        if [[ -z "$VERSION" ]]; then
+          VERSION="${ANDROID_VERSION}-${DETECTED_VERSION}.${DETECTED_PATCHLEVEL}"
+        fi
+
+        SUBLEVEL="${INPUT_SUBLEVEL:-$DETECTED_SUBLEVEL}"
+
+        echo "Detected kernel version: $KERNEL_VERSION"
+        echo "Detected Android version: $ANDROID_VERSION"
+        echo "Detected combined version: $VERSION"
+        echo "Detected sublevel: $SUBLEVEL"
+        echo "Variant: $INPUT_VARIANT"
+        echo "Build timestamp: $BUILD_TIMESTAMP"
+
+        # Empty branding means do not modify setlocalversion at all.
+        if [[ -z "$BRAND_NAME" ]]; then
+          echo "Brand is empty: preserving stock kernel version."
           exit 0
         fi
 
-        KMI=""
-        if [ "$KEEP_KMI" = "true" ]; then
-          KMI=$(grep -h "^KMI_GENERATION" build.config.common build.config.constants 2>/dev/null | head -n 1 | cut -d= -f2)
-          if [ -z "$KMI" ]; then
-            echo "WARNING: KMI_GENERATION not found, falling back to legacy branding"
-          fi
+        # Preserve stock KMI and SCM output by appending a suffix.
+        # Do not replace the original setlocalversion implementation.
+        if ! grep -q 'CUSTOM_KERNEL_BRANDING' scripts/setlocalversion; then
+          cat >> scripts/setlocalversion <<'EOF'
+
+        # CUSTOM_KERNEL_BRANDING
+        if [ -n "${KERNEL_BRAND_SUFFIX:-}" ]; then
+          echo "-${KERNEL_BRAND_SUFFIX}"
+        fi
+        EOF
         fi
 
-        if [ "$KEEP_KMI" = "true" ] && [ -n "$KMI" ]; then
-          if grep -q 'scm_version}"' scripts/setlocalversion; then
-            sed -i '$d' scripts/setlocalversion && echo "echo \"$KERNEL_PART.${{ inputs.sublevel }}-$ANDROID_PART-$KMI-$BRAND\"" >> scripts/setlocalversion
-          else
-            sed -i '$d' scripts/setlocalversion && echo "echo \"-$BRAND\"" >> scripts/setlocalversion
-          fi
-        else
-          if [[ ${{ inputs.version }} == "android15-6.6" || ${{ inputs.version }} == "android16-6.12" || ${{ inputs.version }} == "android17-6.18" ]]; then
-            KERNEL_STRING="$KERNEL_PART.${{ inputs.sublevel }}-$ANDROID_PART"
-            sed -i '$d' scripts/setlocalversion && echo "echo \"$KERNEL_STRING-$BRAND\"" >> scripts/setlocalversion
-          else
-            sed -i '$d' scripts/setlocalversion && echo "echo \"-$ANDROID_PART-$BRAND\"" >> scripts/setlocalversion
-          fi
-        fi
+        # Export the suffix to the Kleaf build environment.
+        echo "KERNEL_BRAND_SUFFIX=$BRAND_NAME" >> "$GITHUB_ENV"
+
         chmod +x scripts/setlocalversion
-        tail -n 1 scripts/setlocalversion
+        echo "Kernel branding enabled: -$BRAND_NAME"
